@@ -132,6 +132,8 @@ pub mod capture {
     i18n_fns! {
         copy_failed => "capture.errors.copy_failed",
         pin_failed => "capture.errors.pin_failed",
+        permission_title => "capture.permission.title",
+        permission_denied => "capture.permission.denied",
     }
 }
 

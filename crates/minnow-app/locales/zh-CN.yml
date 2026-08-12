@@ -80,6 +80,9 @@ capture:
   errors:
     copy_failed: "准备复制图片失败"
     pin_failed: "准备贴图图片失败"
+  permission:
+    title: "需要屏幕录制权限"
+    denied: "MinnowSnap 目前无法捕获其他窗口。请在系统设置中授予“屏幕录制”权限后重新启动。"
 
 preferences:
   window:

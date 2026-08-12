@@ -1,11 +1,34 @@
-use crate::platform::shell;
+use crate::platform::{screen_recording, shell};
 use crate::services::capture::{
     action::{ActionContext, ActionResult, CaptureAction, CaptureActionPlan, PinCaptureRequest},
     service::CaptureService,
 };
 use crate::services::geometry::Rect;
 use crate::services::i18n;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Ensures the process can actually capture other windows before starting a
+/// capture flow.
+///
+/// On macOS a missing Screen Recording permission makes the capture APIs
+/// return only the desktop wallpaper instead of failing. This requests access
+/// (prompting the user once), and if it is still denied, opens the relevant
+/// system settings pane and warns the user rather than letting them capture an
+/// empty desktop. Returns `true` when capture may proceed.
+pub(crate) fn ensure_screen_recording_access() -> bool {
+    if screen_recording::has_access() || screen_recording::request_access() {
+        return true;
+    }
+
+    warn!("Screen Recording permission denied; capture would only see the desktop");
+    screen_recording::open_settings();
+    shell::show_notification(
+        i18n::capture::permission_title().as_str(),
+        i18n::capture::permission_denied().as_str(),
+        shell::NotificationType::Info,
+    );
+    false
+}
 
 /// Executes the platform effects for a domain capture plan.
 ///
@@ -54,6 +77,9 @@ pub(crate) fn execute_capture_action(action: CaptureAction, context: ActionConte
 /// Runs the tray/global-hotkey quick capture path and owns its user feedback.
 pub(crate) fn run_quick_capture_with_notification() {
     info!("Starting quick capture workflow");
+    if !ensure_screen_recording_access() {
+        return;
+    }
     let copied = CaptureService::capture_region(Rect::empty()).is_some_and(|image| {
         let copied = shell::copy_image_to_clipboard(&image);
         if copied {

@@ -1,2 +1,6 @@
-<key>NSUserNotificationAlertStyle</key>
-<string>banner</string>
+  <key>NSUserNotificationAlertStyle</key>
+  <string>banner</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>MinnowSnap needs Screen Recording access to capture screenshots of your screen and windows.</string>
