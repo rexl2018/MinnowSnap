@@ -39,11 +39,25 @@ cargo install cargo-bundle
 # Run from the crate directory so the bundled Info.plist extras resolve.
 cd crates/minnow-app
 cargo bundle --release --format osx
+
+# Re-sign the whole bundle. cargo-bundle leaves only the linker's ad-hoc
+# signature on the inner binary and does not bind the Info.plist, so the
+# bundle signature is invalid. macOS TCC then fails to verify the app and
+# re-prompts for Screen Recording on every capture, never remembering the
+# grant. A fresh ad-hoc signature over the whole bundle fixes this.
+codesign --force --deep --sign - ../../target/release/bundle/osx/MinnowSnap.app
 ```
 
 The bundle is written to `target/release/bundle/osx/MinnowSnap.app`. Launch it
 once and grant Screen Recording access when prompted (or via **System Settings →
 Privacy & Security → Screen & System Audio Recording**), then relaunch the app.
+
+If you rebuilt after already granting access, clear the stale entry so macOS
+re-reads the new signature identity:
+
+```sh
+tccutil reset ScreenCapture com.lortunate.minnowsnap
+```
 
 ## TODO
 
