@@ -232,24 +232,19 @@ fn setting_row(title: SharedString, description: SharedString, disabled: bool, c
                 .items_center()
                 .justify_between()
                 .gap_4()
-                .min_w(px(0.))
                 .child(
                     v_flex()
                         .flex_1()
-                        .min_w(px(0.))
                         .gap_1()
-                        .overflow_hidden()
-                        .child(div().line_clamp(1).text_ellipsis().child(title))
+                        .child(title)
                         .child(
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .line_clamp(2)
-                                .text_ellipsis()
                                 .child(description),
                         ),
                 )
-                .child(div().child(control)),
+                .child(div().flex_shrink_0().child(control)),
         )
         .into_any_element()
 }
