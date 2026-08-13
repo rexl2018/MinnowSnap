@@ -80,6 +80,9 @@ capture:
   errors:
     copy_failed: "Failed to prepare the image for copying"
     pin_failed: "Failed to prepare the image for pinning"
+  permission:
+    title: "Screen Recording permission needed"
+    denied: "MinnowSnap can't see other windows yet. Grant Screen Recording access in System Settings, then relaunch."
 
 preferences:
   window:

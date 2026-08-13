@@ -115,6 +115,9 @@ fn prepare_overlay_session(cx: &mut gpui::App) {
 }
 
 fn open_capture_overlay(cx: &mut gpui::App) {
+    if !workflows::ensure_screen_recording_access() {
+        return;
+    }
     prepare_overlay_session(cx);
     overlay::open_window(cx);
 }

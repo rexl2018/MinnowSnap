@@ -4,6 +4,7 @@ pub mod hotkey;
 pub mod logging;
 pub mod native_window;
 pub mod notify;
+pub mod screen_recording;
 pub mod shell;
 pub mod shutdown;
 pub mod storage;

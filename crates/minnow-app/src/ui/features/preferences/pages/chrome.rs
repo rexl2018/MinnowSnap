@@ -1,6 +1,6 @@
 use super::components::window_brand;
 use crate::platform::shell::{PopupDragBehavior, PopupDragRegionExt};
-use gpui::{AnyElement, App, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{AnyElement, App, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div, px};
 use gpui_component::{ActiveTheme as _, scroll::ScrollableElement, v_flex};
 
 pub(crate) const SIDEBAR_WIDTH: f32 = 208.0;
@@ -88,20 +88,28 @@ pub(crate) fn content_panel(notice: Option<AnyElement>, page_body: AnyElement, c
 
     div()
         .flex_1()
-        .min_w(px(0.))
+        .w_full()
         .min_h(px(0.))
         .flex()
         .flex_col()
+        .overflow_hidden()
         .bg(theme.popover)
         .child(
-            div().flex_1().min_w(px(0.)).min_h(px(0.)).overflow_y_scrollbar().child(
-                div()
-                    .w_full()
-                    .min_w(px(0.))
-                    .px_6()
-                    .py_5()
-                    .child(v_flex().w_full().min_w(px(0.)).gap_5().children(notice).child(page_body)),
-            ),
+            v_flex()
+                .id("preferences-content")
+                .flex_1()
+                .w_full()
+                .min_h(px(0.))
+                .overflow_y_scrollbar()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .px_6()
+                        .py_5()
+                        .gap_5()
+                        .children(notice)
+                        .child(page_body),
+                ),
         )
         .into_any_element()
 }
