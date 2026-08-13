@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow};
 use gpui::{App, Window};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn raw_window_handle(window: &Window) -> Result<RawWindowHandle> {
     HasWindowHandle::window_handle(window)
         .map(|handle| handle.as_raw())
@@ -49,6 +49,11 @@ pub fn with_level<T>(level: Level, build: impl FnOnce(&mut Window, &mut App) -> 
         log_window_level_result(level, window.set_level(level));
         build(window, cx)
     }
+}
+
+/// Stretch a popup so it covers the active display, including the macOS menu bar.
+pub fn cover_active_screen(window: &Window) -> Result<()> {
+    platform::cover_active_screen(window)
 }
 
 #[cfg(target_os = "windows")]
@@ -99,6 +104,10 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn cover_active_screen(_window: &Window) -> Result<()> {
+        Ok(())
+    }
+
     pub(super) fn set_click_through(window: &Window, enabled: bool) -> Result<()> {
         let hwnd = hwnd(window)?;
 
@@ -125,7 +134,72 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::*;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSScreen, NSScreenSaverWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask};
+    use raw_window_handle::RawWindowHandle;
+
+    pub(super) fn set_level(window: &Window, level: Level) -> Result<()> {
+        let ns_window = ns_window(window)?;
+        match level {
+            Level::Normal => ns_window.setLevel(0),
+            Level::AlwaysOnTop => {
+                ns_window.setLevel(NSScreenSaverWindowLevel);
+                ns_window.setCollectionBehavior(
+                    NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary,
+                );
+                ns_window.setHidesOnDeactivate(false);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn cover_active_screen(window: &Window) -> Result<()> {
+        let ns_window = ns_window(window)?;
+        // GPUI popups still use NSTitledWindowMask, so AppKit constrains them
+        // below the menu bar. Borderless windows can cover it once the level is
+        // above NSMainMenuWindowLevel.
+        ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        ns_window.setHasShadow(false);
+        ns_window.setOpaque(true);
+        ns_window.setHidesOnDeactivate(false);
+        ns_window.setIgnoresMouseEvents(false);
+        ns_window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        ns_window.setLevel(NSScreenSaverWindowLevel);
+
+        let frame = ns_window
+            .screen()
+            .map(|screen| screen.frame())
+            .or_else(|| MainThreadMarker::new().and_then(NSScreen::mainScreen).map(|screen| screen.frame()))
+            .ok_or_else(|| anyhow!("no screen available for overlay"))?;
+        ns_window.setFrame_display(frame, true);
+        Ok(())
+    }
+
+    pub(super) fn set_click_through(_window: &Window, enabled: bool) -> Result<()> {
+        if !enabled {
+            Ok(())
+        } else {
+            unsupported_platform_operation("click-through")
+        }
+    }
+
+    fn ns_window(window: &Window) -> Result<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+        let RawWindowHandle::AppKit(handle) = raw_window_handle(window)? else {
+            return Err(anyhow!("expected AppKit window handle"));
+        };
+        // SAFETY: GPUI's AppKit handle is an NSView that outlives the Window.
+        let ns_view = unsafe { objc2::rc::Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }
+            .ok_or_else(|| anyhow!("failed to retain NSView"))?;
+        ns_view.window().ok_or_else(|| anyhow!("NSView has no NSWindow"))
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod platform {
     use super::*;
 
@@ -135,6 +209,10 @@ mod platform {
         } else {
             unsupported_platform_operation("window levels")
         }
+    }
+
+    pub(super) fn cover_active_screen(_window: &Window) -> Result<()> {
+        Ok(())
     }
 
     pub(super) fn set_click_through(_window: &Window, enabled: bool) -> Result<()> {

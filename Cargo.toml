@@ -27,7 +27,7 @@ ndarray = "0.17"
 notify-rust = "4"
 num-traits = "0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSScreen", "NSView", "NSWindow"] }
 ort = "=2.0.0-rc.13"
 oxipng = { version = "10.2", default-features = false, features = ["parallel"] }
 raw-window-handle = "0.6"
