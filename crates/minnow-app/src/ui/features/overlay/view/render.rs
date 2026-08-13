@@ -17,14 +17,14 @@ use crate::ui::features::overlay::render::toolbar::{OverlayToolbarState, overlay
 use crate::ui::features::overlay::state::{AnnotationKindTag, OverlayCommand, OverlayFrame, PickerVm};
 use crate::ui::features::overlay::window_catalog::WindowInfo;
 use gpui::InteractiveElement;
-use gpui::{Context, Div, Entity, IntoElement, MouseButton, ParentElement, Stateful, Styled, Window, div, img};
+use gpui::{Context, Div, Entity, IntoElement, MouseButton, ObjectFit, ParentElement, Stateful, Styled, StyledImage, Window, div, img};
 use gpui_component::{ActiveTheme, color_picker::ColorPickerState};
 use std::rc::Rc;
 
 impl OverlayView {
     fn background_layer(background_image: Option<std::sync::Arc<gpui::RenderImage>>, background: gpui::Hsla) -> Div {
         if let Some(image) = background_image {
-            Self::overlay_layer().child(img(image).size_full())
+            Self::overlay_layer().child(img(image).size_full().object_fit(ObjectFit::Fill))
         } else {
             Self::overlay_layer().bg(background)
         }

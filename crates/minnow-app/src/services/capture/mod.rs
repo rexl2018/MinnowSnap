@@ -147,7 +147,12 @@ fn capture_active_monitor() -> Option<RgbaImage> {
 
 #[must_use]
 fn active_monitor() -> Option<Monitor> {
-    Monitor::all().ok()?.into_iter().next()
+    let monitors = Monitor::all().ok()?;
+    monitors
+        .iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .cloned()
+        .or_else(|| monitors.into_iter().next())
 }
 
 #[cfg(test)]

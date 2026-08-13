@@ -24,6 +24,17 @@ pub(crate) fn with_always_on_top<R: 'static>(
     super::native_window::with_level(Level::AlwaysOnTop, f)
 }
 
+pub(crate) fn with_screen_overlay<R: 'static>(
+    f: impl FnOnce(&mut Window, &mut App) -> R + 'static,
+) -> impl FnOnce(&mut Window, &mut App) -> R + 'static {
+    super::native_window::with_level(Level::AlwaysOnTop, move |window, cx| {
+        if let Err(err) = super::native_window::cover_active_screen(window) {
+            tracing::warn!("Failed to cover the active display: {err}");
+        }
+        f(window, cx)
+    })
+}
+
 pub(crate) fn set_always_on_top(window: &mut Window) -> Result<()> {
     window.set_level(Level::AlwaysOnTop)
 }

@@ -65,17 +65,6 @@ impl Rect {
             None
         }
     }
-
-    #[must_use]
-    #[inline]
-    pub fn is_inside(self, other: Self) -> bool {
-        let s_x2 = i64::from(self.x) + i64::from(self.width.max(0));
-        let s_y2 = i64::from(self.y) + i64::from(self.height.max(0));
-        let o_x2 = i64::from(other.x) + i64::from(other.width.max(0));
-        let o_y2 = i64::from(other.y) + i64::from(other.height.max(0));
-
-        self.x >= other.x && self.y >= other.y && s_x2 <= o_x2 && s_y2 <= o_y2
-    }
 }
 
 pub struct NormalizedRect {
