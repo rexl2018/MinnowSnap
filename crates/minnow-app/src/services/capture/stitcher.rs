@@ -23,7 +23,8 @@ pub struct StitchConfig {
     pub min_scroll_threshold: u32,
     pub dynamic_block_size: usize,
     pub dynamic_threshold: f32,
-    pub min_stable_blocks: usize,
+    pub min_content_blocks: usize,
+    pub content_energy_ratio: f32,
     pub zncc_strip_count: usize,
     pub zncc_patch_height: usize,
     pub zncc_search_radius: i32,
@@ -39,7 +40,8 @@ impl Default for StitchConfig {
             min_scroll_threshold: 4,
             dynamic_block_size: 16,
             dynamic_threshold: 12.0,
-            min_stable_blocks: 6,
+            min_content_blocks: 3,
+            content_energy_ratio: 0.12,
             zncc_strip_count: 6,
             zncc_patch_height: 8,
             zncc_search_radius: 8,
@@ -70,7 +72,7 @@ impl FrameAnalysis {
 
 #[derive(Default)]
 struct StitchScratch {
-    stable_blocks: Vec<usize>,
+    content_blocks: Vec<usize>,
     signature_prev: Vec<f32>,
     signature_next: Vec<f32>,
     coarse_prev: Vec<f32>,
@@ -298,7 +300,7 @@ impl ScrollStitcher {
 
         let width = prev_analysis.width;
         let height = prev_analysis.height;
-        let (fixed_top, fixed_bottom) = self.detect_sticky_regions(&prev_analysis.gray, &next_analysis.gray, width, height);
+        let (fixed_top, fixed_bottom) = self.detect_sticky_regions(&prev_analysis.gray, &next_analysis.gray, &prev_analysis.edge, width, height);
         let region = StitchRegion {
             width,
             height,
@@ -320,15 +322,15 @@ impl ScrollStitcher {
             prev: &prev_analysis.gray,
             next: &next_analysis.gray,
         };
-        Self::detect_stable_blocks(self.config, gray_pair, region, &mut self.scratch.stable_blocks);
+        Self::detect_content_blocks(self.config, &prev_analysis.edge, &next_analysis.edge, region, &mut self.scratch.content_blocks);
 
-        if self.scratch.stable_blocks.len() < self.config.min_stable_blocks {
+        if self.scratch.content_blocks.len() < self.config.min_content_blocks {
             self.last_analysis = Some(next_analysis);
             self.last_footer_height = fixed_bottom;
             return StitchFrameResult {
                 status: StitchFrameStatus::LowConfidence,
                 height: self.valid_height as i32,
-                warning: Some("Dynamic content dominates viewport; wait for a stable frame".to_string()),
+                warning: Some("Not enough textured content to track scrolling".to_string()),
             };
         }
 
@@ -336,14 +338,14 @@ impl ScrollStitcher {
             self.config,
             &prev_analysis.edge,
             region,
-            &self.scratch.stable_blocks,
+            &self.scratch.content_blocks,
             &mut self.scratch.signature_prev,
         );
         Self::row_signature(
             self.config,
             &next_analysis.edge,
             region,
-            &self.scratch.stable_blocks,
+            &self.scratch.content_blocks,
             &mut self.scratch.signature_next,
         );
 
@@ -363,7 +365,7 @@ impl ScrollStitcher {
             gray_pair,
             region,
             coarse_shift,
-            &self.scratch.stable_blocks,
+            &self.scratch.content_blocks,
             &mut self.scratch.strip_scores,
         );
 
@@ -432,7 +434,7 @@ impl ScrollStitcher {
             };
         }
 
-        let cut_valid = self.find_smart_seam(gray_pair, region, overlap_valid, &self.scratch.stable_blocks);
+        let cut_valid = self.find_smart_seam(gray_pair, region, overlap_valid, &self.scratch.content_blocks);
 
         let trim_prev = overlap_valid.saturating_sub(cut_valid);
         let append_start = fixed_top as usize + cut_valid;
@@ -512,23 +514,41 @@ impl ScrollStitcher {
         out
     }
 
-    fn detect_sticky_regions(&self, prev: &[f32], next: &[f32], width: usize, height: usize) -> (u32, u32) {
+    /// Detect fixed (sticky) header/footer bands that stay put while the body
+    /// scrolls, so they are not appended repeatedly.
+    ///
+    /// A band only counts as sticky when it is both *unchanged* between frames
+    /// AND carries real content (edge energy). Blank rows are unchanged too —
+    /// the whitespace at the top/bottom of a scrolling viewport looks identical
+    /// frame to frame — but they are empty scroll space, not a sticky UI band.
+    /// Treating them as sticky would trim real content out of the stitch.
+    fn detect_sticky_regions(&self, prev: &[f32], next: &[f32], edge_prev: &[f32], width: usize, height: usize) -> (u32, u32) {
         if width == 0 || height == 0 {
             return (0, 0);
         }
 
-        let threshold = self.config.dynamic_threshold;
+        let diff_threshold = self.config.dynamic_threshold;
+        let content_threshold = self.config.dynamic_threshold;
         let max_check = (height / 3).max(1);
 
-        let mut top = 0usize;
-        while top < max_check {
-            let row_start = top * width;
+        let row_metrics = |row: usize| -> (f32, f32) {
+            let row_start = row * width;
             let mut diff = 0.0f32;
+            let mut energy = 0.0f32;
             for x in 0..width {
                 let idx = row_start + x;
                 diff += (prev[idx] - next[idx]).abs();
+                energy += edge_prev[idx];
             }
-            if diff / width as f32 > threshold {
+            (diff / width as f32, energy / width as f32)
+        };
+
+        let mut top = 0usize;
+        while top < max_check {
+            let (diff, energy) = row_metrics(top);
+            // Stop at the first row that either moved or is blank: a sticky band
+            // is a contiguous run of unchanged, content-bearing rows.
+            if diff > diff_threshold || energy < content_threshold {
                 break;
             }
             top += 1;
@@ -536,14 +556,8 @@ impl ScrollStitcher {
 
         let mut bottom = 0usize;
         while bottom < max_check {
-            let row = height - 1 - bottom;
-            let row_start = row * width;
-            let mut diff = 0.0f32;
-            for x in 0..width {
-                let idx = row_start + x;
-                diff += (prev[idx] - next[idx]).abs();
-            }
-            if diff / width as f32 > threshold {
+            let (diff, energy) = row_metrics(height - 1 - bottom);
+            if diff > diff_threshold || energy < content_threshold {
                 break;
             }
             bottom += 1;
@@ -552,7 +566,16 @@ impl ScrollStitcher {
         (top as u32, bottom as u32)
     }
 
-    fn detect_stable_blocks(config: StitchConfig, pair: FramePairRef<'_>, region: StitchRegion, out: &mut Vec<usize>) {
+    /// Select the vertical column-blocks that carry enough texture (edge
+    /// energy) to be useful for vertical scroll correlation.
+    ///
+    /// Scroll stitching aligns two frames by matching their textured content.
+    /// Flat regions — whitespace margins, solid backgrounds — carry no vertical
+    /// signal and must be skipped. We therefore keep the blocks whose combined
+    /// edge energy is a meaningful fraction of the busiest block, rather than
+    /// the blocks that happen to be *unchanged* between frames (which, while
+    /// scrolling, are exactly the empty margins and thus useless for matching).
+    fn detect_content_blocks(config: StitchConfig, edge_prev: &[f32], edge_next: &[f32], region: StitchRegion, out: &mut Vec<usize>) {
         let block = config.dynamic_block_size.max(8);
         let block_count = (region.width / block).max(1);
         let y_start = region.fixed_top.min(region.height);
@@ -563,35 +586,45 @@ impl ScrollStitcher {
             out.reserve(block_count - out.capacity());
         }
 
+        let mut energies = Vec::with_capacity(block_count);
+        let mut max_energy = 0.0f32;
         for b in 0..block_count {
             let x0 = b * block;
             let x1 = ((b + 1) * block).min(region.width);
             if x1 <= x0 {
+                energies.push(0.0);
                 continue;
             }
 
-            let mut diff_sum = 0.0f32;
+            let mut energy_sum = 0.0f32;
             let mut count = 0usize;
             for y in y_start..y_end {
                 let row = y * region.width;
                 for x in x0..x1 {
                     let i = row + x;
-                    diff_sum += (pair.prev[i] - pair.next[i]).abs();
+                    energy_sum += edge_prev[i] + edge_next[i];
                     count += 1;
                 }
             }
 
-            if count == 0 {
-                continue;
-            }
-            let avg = diff_sum / count as f32;
-            if avg <= config.dynamic_threshold {
+            let energy = if count == 0 { 0.0 } else { energy_sum / count as f32 };
+            max_energy = max_energy.max(energy);
+            energies.push(energy);
+        }
+
+        if max_energy <= f32::EPSILON {
+            return;
+        }
+
+        let threshold = max_energy * config.content_energy_ratio;
+        for (b, &energy) in energies.iter().enumerate() {
+            if energy >= threshold {
                 out.push(b);
             }
         }
     }
 
-    fn row_signature(config: StitchConfig, edge: &[f32], region: StitchRegion, stable_blocks: &[usize], out: &mut Vec<f32>) {
+    fn row_signature(config: StitchConfig, edge: &[f32], region: StitchRegion, content_blocks: &[usize], out: &mut Vec<f32>) {
         let block = config.dynamic_block_size.max(8);
         let y_start = region.fixed_top.min(region.height);
         let y_end = region.height.saturating_sub(region.fixed_bottom).max(y_start + 1);
@@ -605,7 +638,7 @@ impl ScrollStitcher {
             let row = y * region.width;
             let mut sum = 0.0f32;
             let mut n = 0usize;
-            for &b in stable_blocks {
+            for &b in content_blocks {
                 let x0 = b * block;
                 let x1 = ((b + 1) * block).min(region.width);
                 for x in x0..x1 {
@@ -757,7 +790,7 @@ impl ScrollStitcher {
         pair: FramePairRef<'_>,
         region: StitchRegion,
         coarse_shift: i32,
-        stable_blocks: &[usize],
+        content_blocks: &[usize],
         strip_scores: &mut Vec<f32>,
     ) -> Option<(i32, f32, f32)> {
         let valid_h = region.valid_height() as i32;
@@ -778,7 +811,7 @@ impl ScrollStitcher {
         let search_end = (coarse_shift + config.zncc_search_radius).min(max_shift);
 
         for shift in search_start..=search_end {
-            let score = Self::zncc_score_for_shift(config, pair, region, shift, stable_blocks, strip_scores);
+            let score = Self::zncc_score_for_shift(config, pair, region, shift, content_blocks, strip_scores);
 
             if score > best_score {
                 second_score = best_score;
@@ -805,7 +838,7 @@ impl ScrollStitcher {
         pair: FramePairRef<'_>,
         region: StitchRegion,
         shift: i32,
-        stable_blocks: &[usize],
+        content_blocks: &[usize],
         strip_scores: &mut Vec<f32>,
     ) -> f32 {
         let valid_h = region.valid_height() as i32;
@@ -836,7 +869,7 @@ impl ScrollStitcher {
 
             let mut score_sum = 0.0f32;
             let mut score_count = 0usize;
-            for &b in stable_blocks {
+            for &b in content_blocks {
                 let x0 = (b as i32 * block).min(region.width as i32 - 1);
                 let x1 = ((b as i32 + 1) * block).min(region.width as i32);
                 if x1 - x0 < 2 {
@@ -911,7 +944,7 @@ impl ScrollStitcher {
         cov / denom
     }
 
-    fn find_smart_seam(&self, pair: FramePairRef<'_>, region: StitchRegion, overlap_valid: usize, stable_blocks: &[usize]) -> usize {
+    fn find_smart_seam(&self, pair: FramePairRef<'_>, region: StitchRegion, overlap_valid: usize, content_blocks: &[usize]) -> usize {
         let block = self.config.dynamic_block_size.max(8);
         let search_start = overlap_valid / self.config.seam_margin_divisor.max(2) as usize;
         let search_end =
@@ -929,7 +962,7 @@ impl ScrollStitcher {
 
             let mut energy = 0.0f32;
             let mut n = 0usize;
-            for &b in stable_blocks {
+            for &b in content_blocks {
                 let x0 = b * block;
                 let x1 = ((b + 1) * block).min(region.width);
                 for x in x0..x1 {
@@ -1035,18 +1068,106 @@ mod tests {
         imageops::crop_imm(source, 0, y, source.width(), h).to_image()
     }
 
+    /// A text-like page: white background, sparse dark "glyphs" on periodic
+    /// text lines, with whitespace left/right margins — the layout of a
+    /// typical web article or chat log. Every text line gets a distinct glyph
+    /// pattern so rows are not self-similar (as with real anti-aliased text).
+    fn text_page(width: u32, height: u32) -> RgbaImage {
+        let mut page = RgbaImage::from_pixel(width, height, Rgba([250, 250, 250, 255]));
+        let margin = width / 10;
+        for y in 0..height {
+            // Denser text: 20px line pitch, 16px glyph band (like body copy).
+            if (y % 20) < 16 {
+                let line = y / 20;
+                for x in margin..(width - margin) {
+                    let h = (x.wrapping_mul(2_654_435_761)) ^ (y.wrapping_mul(40_503)) ^ (line.wrapping_mul(2_246_822_519));
+                    if (h & 0x3) < 2 {
+                        let v = (h >> 8 & 0x3f) as u8;
+                        page.put_pixel(x, y, Rgba([v, v, v, 255]));
+                    }
+                }
+            }
+        }
+        page
+    }
+
+    #[test]
+    fn stitcher_reconstructs_full_page_on_scroll() {
+        // Regression: text pages have whitespace margins, so the old
+        // "unchanged column" selector kept only the (flat) margins and
+        // rejected every frame after the first, capturing just one viewport.
+        // The old sticky-region detector also mistook scrolling whitespace for
+        // a fixed footer and trimmed real content. With both fixed, a full
+        // top-to-bottom scroll must reconstruct far more than one viewport.
+        let page_w = 300u32;
+        let page_h = 1800u32;
+        let view_h = 300u32;
+        let page = text_page(page_w, page_h);
+
+        for step in [4u32, 8, 12] {
+            let mut stitcher = ScrollStitcher::new();
+            let mut y = 0u32;
+            let mut guard = 0;
+            loop {
+                let _ = stitcher.process_frame_detailed(crop_frame(&page, y, view_h));
+                if y + view_h >= page_h {
+                    break;
+                }
+                y = (y + step).min(page_h - view_h);
+                guard += 1;
+                assert!(guard < 5000, "scroll loop failed to terminate");
+            }
+
+            let final_img = stitcher.get_final_image().expect("final image");
+            // Must reconstruct well beyond a single viewport. (A lossy stitcher
+            // drops some frames at speed, so we require solid coverage rather
+            // than the full page height.)
+            assert!(
+                final_img.height() >= view_h * 2,
+                "step={step}: expected >= {} rows (much more than one viewport), got {}",
+                view_h * 2,
+                final_img.height()
+            );
+        }
+    }
+
+    #[test]
+    fn detect_content_blocks_skips_flat_margins() {
+        // Whitespace margins carry no edge energy and must be excluded, while
+        // the textured interior columns are kept.
+        let page = text_page(300, 400);
+        let analysis = FrameAnalysis::from_image(&page);
+        let region = StitchRegion {
+            width: analysis.width,
+            height: analysis.height,
+            fixed_top: 0,
+            fixed_bottom: 0,
+        };
+        let mut blocks = Vec::new();
+        ScrollStitcher::detect_content_blocks(StitchConfig::default(), &analysis.edge, &analysis.edge, region, &mut blocks);
+
+        assert!(blocks.len() >= StitchConfig::default().min_content_blocks);
+        // The far-left margin block (block 0) is flat white and must be dropped.
+        assert!(!blocks.contains(&0), "flat left margin should not be a content block");
+    }
+
     #[test]
     fn stitcher_appends_on_forward_scroll() {
         let mut stitcher = ScrollStitcher::new();
-        let src = source(240, 420);
+        let src = text_page(240, 900);
 
-        let first = crop_frame(&src, 0, 180);
-        let second = crop_frame(&src, 24, 180);
-
-        assert_eq!(stitcher.process_frame_detailed(first).status, StitchFrameStatus::Appended);
-        let detail = stitcher.process_frame_detailed(second);
-        assert!(matches!(detail.status, StitchFrameStatus::Appended | StitchFrameStatus::LowConfidence));
-        assert!(detail.height >= 180);
+        // Feed a short sequence of small forward scrolls, as the live capture
+        // loop does (~16ms frames). The canvas must grow past the first frame.
+        assert_eq!(stitcher.process_frame_detailed(crop_frame(&src, 0, 300)).status, StitchFrameStatus::Appended);
+        let mut appended = 0;
+        for y in [8u32, 16, 24, 32, 40] {
+            if stitcher.process_frame_detailed(crop_frame(&src, y, 300)).status == StitchFrameStatus::Appended {
+                appended += 1;
+            }
+        }
+        assert!(appended >= 3, "expected most small scrolls to append, got {appended}/5");
+        let (_, height) = stitcher.current_image().expect("canvas");
+        assert!(height > 300, "canvas should extend past the first frame, got {height}");
     }
 
     #[test]
