@@ -244,18 +244,23 @@ impl LongCaptureCoordinator {
         self.state_guard().has_registered_windows()
     }
 
+    fn refresh_window<C: AppContext>(handle: Option<AnyWindowHandle>, cx: &mut C) -> bool {
+        handle.is_some_and(|handle| {
+            handle
+                .update(cx, |view, window, cx| {
+                    window.refresh();
+                    cx.notify(view.entity_id());
+                })
+                .is_ok()
+        })
+    }
+
     fn notify_registered_windows<C: AppContext>(&self, cx: &mut C) -> bool {
         let handles = self.state_guard().handles.clone();
 
-        let frame_alive = handles
-            .frame
-            .is_some_and(|handle| handle.update(cx, |_, window, _| window.refresh()).is_ok());
-        let toolbar_alive = handles
-            .toolbar
-            .is_some_and(|handle| handle.update(cx, |_, window, _| window.refresh()).is_ok());
-        let preview_alive = handles
-            .preview
-            .is_some_and(|handle| handle.update(cx, |_, window, _| window.refresh()).is_ok());
+        let frame_alive = Self::refresh_window(handles.frame, cx);
+        let toolbar_alive = Self::refresh_window(handles.toolbar, cx);
+        let preview_alive = Self::refresh_window(handles.preview, cx);
 
         self.state_guard().clear_dead_windows(frame_alive, toolbar_alive, preview_alive);
 

@@ -14,6 +14,7 @@ APP_NAME = "MinnowSnap"
 APP_PACKAGE = "minnow-app"
 APP_MANIFEST = Path("crates") / APP_PACKAGE / "Cargo.toml"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOY_DIR = PROJECT_ROOT / "target" / "deploy"
 WINDOWS_DEBUG_GLOBS = ("*.pdb", "*.ilk", "*.exp", "*.lib", "*.a", "*.cmake")
 
@@ -255,6 +256,27 @@ def dist_windows(options: DistOptions) -> None:
     print_action("Finished", f"output: {zip_path}")
 
 
+def sign_macos_bundle(bundle_path: Path) -> None:
+    """Sign the .app with the stable local identity via scripts/macos-sign.sh.
+
+    cargo-bundle only leaves an ad-hoc signature, whose designated requirement
+    is the per-build cdhash. macOS TCC then re-prompts for Screen Recording on
+    every rebuild. macos-sign.sh signs with a persistent self-signed identity
+    so the grant survives rebuilds. Signing failure is non-fatal: the DMG is
+    still usable, it just re-prompts for permission like the old ad-hoc flow.
+    """
+    sign_script = SCRIPT_DIR / "macos-sign.sh"
+    if not sign_script.exists():
+        print_action("Warning", f"{sign_script.name} not found; skipping stable signing")
+        return
+
+    print_action("Signing", "bundle with stable local identity")
+    try:
+        subprocess.run([str(sign_script), str(bundle_path)], cwd=PROJECT_ROOT, check=True)
+    except subprocess.CalledProcessError:
+        print_action("Warning", "stable signing failed; bundle keeps its ad-hoc signature")
+
+
 def dist_macos() -> None:
     print_action("Building", "bundle (cargo bundle)")
     run_command(["cargo", "bundle", "--manifest-path", str(APP_MANIFEST), "--release"])
@@ -262,6 +284,8 @@ def dist_macos() -> None:
     bundle_path = get_target_dir("release") / "bundle" / "osx" / f"{APP_NAME}.app"
     if not bundle_path.exists():
         fail(f"Error: {bundle_path} not found")
+
+    sign_macos_bundle(bundle_path)
 
     ensure_clean_dir(DEPLOY_DIR)
     dmg_path = DEPLOY_DIR / macos_dmg_name()

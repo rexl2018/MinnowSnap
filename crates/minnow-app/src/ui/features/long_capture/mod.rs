@@ -54,6 +54,9 @@ pub fn open_window(cx: &mut App, request: LongCaptureRequest) {
             if let Err(err) = shell::set_always_on_top(window) {
                 tracing::warn!("Failed to set frame window level: {err}");
             }
+            if let Err(err) = shell::exclude_from_capture(window) {
+                tracing::warn!("Failed to exclude frame window from capture: {err}");
+            }
 
             let frame_click_through_ok = shell::set_click_through(window, true).is_ok();
             if !frame_click_through_ok {
@@ -81,6 +84,9 @@ pub fn open_window(cx: &mut App, request: LongCaptureRequest) {
             if let Err(err) = shell::set_always_on_top(window) {
                 tracing::warn!("Failed to set toolbar window level: {err}");
             }
+            if let Err(err) = shell::exclude_from_capture(window) {
+                tracing::warn!("Failed to exclude toolbar window from capture: {err}");
+            }
             let focus_handle = cx.focus_handle();
             coordinator.register_window(LongCaptureWindowKind::Toolbar, window.window_handle());
             cx.new(|cx| ToolbarWindowView::new(coordinator, focus_handle, window, cx))
@@ -98,6 +104,9 @@ pub fn open_window(cx: &mut App, request: LongCaptureRequest) {
         window.set_background_appearance(WindowBackgroundAppearance::Transparent);
         if let Err(err) = shell::set_always_on_top(window) {
             tracing::warn!("Failed to set preview window level: {err}");
+        }
+        if let Err(err) = shell::exclude_from_capture(window) {
+            tracing::warn!("Failed to exclude preview window from capture: {err}");
         }
         coordinator.register_window(LongCaptureWindowKind::Preview, window.window_handle());
         cx.new(|cx| PreviewWindowView::new(coordinator, window, cx))
