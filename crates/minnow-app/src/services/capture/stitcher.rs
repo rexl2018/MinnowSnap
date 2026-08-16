@@ -23,10 +23,17 @@ pub struct StitchConfig {
     pub min_scroll_threshold: u32,
     pub dynamic_block_size: usize,
     pub dynamic_threshold: f32,
-    pub min_stable_blocks: usize,
-    pub zncc_strip_count: usize,
-    pub zncc_patch_height: usize,
-    pub zncc_search_radius: i32,
+    pub min_content_blocks: usize,
+    pub content_energy_ratio: f32,
+    pub max_reverse_scroll: i32,
+    /// Largest forward scroll (in px) to search for between two frames. A
+    /// momentum flick can exceed this; such frames are simply skipped until the
+    /// scroll slows enough that consecutive frames overlap within this range.
+    pub max_scroll_per_frame: i32,
+    /// Column/row stride for the coarse ZNCC scan (>=1). The full-overlap ZNCC
+    /// metric is decisive enough to survive subsampling, which keeps the scan
+    /// cheap enough to run every frame.
+    pub scan_stride: usize,
     pub low_confidence_threshold: f32,
     pub low_confidence_gap: f32,
     pub seam_margin_divisor: u32,
@@ -39,12 +46,13 @@ impl Default for StitchConfig {
             min_scroll_threshold: 4,
             dynamic_block_size: 16,
             dynamic_threshold: 12.0,
-            min_stable_blocks: 6,
-            zncc_strip_count: 6,
-            zncc_patch_height: 8,
-            zncc_search_radius: 8,
-            low_confidence_threshold: 0.52,
-            low_confidence_gap: 0.06,
+            min_content_blocks: 3,
+            content_energy_ratio: 0.12,
+            max_reverse_scroll: 8,
+            max_scroll_per_frame: 400,
+            scan_stride: 4,
+            low_confidence_threshold: 0.6,
+            low_confidence_gap: 0.0,
             seam_margin_divisor: 5,
         }
     }
@@ -70,14 +78,7 @@ impl FrameAnalysis {
 
 #[derive(Default)]
 struct StitchScratch {
-    stable_blocks: Vec<usize>,
-    signature_prev: Vec<f32>,
-    signature_next: Vec<f32>,
-    coarse_prev: Vec<f32>,
-    coarse_next: Vec<f32>,
-    medium_prev: Vec<f32>,
-    medium_next: Vec<f32>,
-    strip_scores: Vec<f32>,
+    content_blocks: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,15 +107,6 @@ struct StitchAppendPlan {
     append_start_y: u32,
     append_end_y: u32,
     fixed_bottom: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ZNCCPatch {
-    x0: usize,
-    x1: usize,
-    y0_prev: usize,
-    y0_next: usize,
-    patch_h: usize,
 }
 
 #[derive(Default)]
@@ -298,7 +290,7 @@ impl ScrollStitcher {
 
         let width = prev_analysis.width;
         let height = prev_analysis.height;
-        let (fixed_top, fixed_bottom) = self.detect_sticky_regions(&prev_analysis.gray, &next_analysis.gray, width, height);
+        let (fixed_top, fixed_bottom) = self.detect_sticky_regions(&prev_analysis.gray, &next_analysis.gray, &prev_analysis.edge, width, height);
         let region = StitchRegion {
             width,
             height,
@@ -320,52 +312,23 @@ impl ScrollStitcher {
             prev: &prev_analysis.gray,
             next: &next_analysis.gray,
         };
-        Self::detect_stable_blocks(self.config, gray_pair, region, &mut self.scratch.stable_blocks);
+        Self::detect_content_blocks(self.config, &prev_analysis.edge, &next_analysis.edge, region, &mut self.scratch.content_blocks);
 
-        if self.scratch.stable_blocks.len() < self.config.min_stable_blocks {
+        if self.scratch.content_blocks.len() < self.config.min_content_blocks {
             self.last_analysis = Some(next_analysis);
             self.last_footer_height = fixed_bottom;
             return StitchFrameResult {
                 status: StitchFrameStatus::LowConfidence,
                 height: self.valid_height as i32,
-                warning: Some("Dynamic content dominates viewport; wait for a stable frame".to_string()),
+                warning: Some("Not enough textured content to track scrolling".to_string()),
             };
         }
 
-        Self::row_signature(
-            self.config,
-            &prev_analysis.edge,
-            region,
-            &self.scratch.stable_blocks,
-            &mut self.scratch.signature_prev,
-        );
-        Self::row_signature(
-            self.config,
-            &next_analysis.edge,
-            region,
-            &self.scratch.stable_blocks,
-            &mut self.scratch.signature_next,
-        );
-
-        let coarse_shift = Self::multiscale_row_shift(
-            &self.scratch.signature_prev,
-            &self.scratch.signature_next,
-            self.config.min_overlap as usize,
-            &mut self.scratch.coarse_prev,
-            &mut self.scratch.coarse_next,
-            &mut self.scratch.medium_prev,
-            &mut self.scratch.medium_next,
-        )
-        .unwrap_or(0);
-
-        let refine = Self::refine_shift_zncc(
-            self.config,
-            gray_pair,
-            region,
-            coarse_shift,
-            &self.scratch.stable_blocks,
-            &mut self.scratch.strip_scores,
-        );
+        // Locate the scroll offset by scanning shifts with the full-overlap
+        // ZNCC metric directly (see refine_shift_zncc). No coarse row-signature
+        // seed: on self-similar content that proxy returned wrong seeds and the
+        // true offset fell outside the refine window.
+        let refine = Self::refine_shift_zncc(self.config, gray_pair, region, &self.scratch.content_blocks);
 
         let Some((delta, best_score, second_score)) = refine else {
             self.last_analysis = Some(next_analysis);
@@ -376,6 +339,24 @@ impl ScrollStitcher {
                 warning: Some("Unable to estimate reliable overlap".to_string()),
             };
         };
+
+        // Trust the estimated shift BEFORE interpreting its sign or magnitude.
+        // A momentum flick can move 500+px between two 16ms frames, collapsing
+        // the overlap so the matcher locks onto a garbage peak at the search
+        // boundary (near-zero score, often negative). Classifying that as
+        // "reverse" or appending it would corrupt the stitch, so a low-
+        // confidence frame is simply skipped — and we KEEP the previous
+        // reference frame so a single bad match does not discard the scroll
+        // position accumulated so far.
+        let confidence_gap = best_score - second_score;
+        if best_score < self.config.low_confidence_threshold || confidence_gap < self.config.low_confidence_gap {
+            self.last_analysis = Some(prev_analysis);
+            return StitchFrameResult {
+                status: StitchFrameStatus::LowConfidence,
+                height: self.valid_height as i32,
+                warning: Some("Low confidence overlap match; keep scrolling smoothly".to_string()),
+            };
+        }
 
         if delta < 0 {
             self.last_analysis = Some(next_analysis);
@@ -389,23 +370,17 @@ impl ScrollStitcher {
 
         let delta = delta as u32;
         if delta < self.config.min_scroll_threshold {
-            self.last_analysis = Some(next_analysis);
-            self.last_footer_height = fixed_bottom;
+            // Sub-threshold motion: keep the PREVIOUS reference frame instead of
+            // advancing to this one. During slow scrolling each ~16ms frame
+            // moves only a pixel or two — if we reset the reference every time,
+            // that motion never accumulates and nothing is ever appended (the
+            // canvas freezes at the first frame). Holding the reference lets the
+            // offset grow across frames until it crosses the threshold.
+            self.last_analysis = Some(prev_analysis);
             return StitchFrameResult {
                 status: StitchFrameStatus::Stationary,
                 height: self.valid_height as i32,
                 warning: None,
-            };
-        }
-
-        let confidence_gap = best_score - second_score;
-        if best_score < self.config.low_confidence_threshold || confidence_gap < self.config.low_confidence_gap {
-            self.last_analysis = Some(next_analysis);
-            self.last_footer_height = fixed_bottom;
-            return StitchFrameResult {
-                status: StitchFrameStatus::LowConfidence,
-                height: self.valid_height as i32,
-                warning: Some("Low confidence overlap match; keep scrolling smoothly".to_string()),
             };
         }
 
@@ -432,7 +407,7 @@ impl ScrollStitcher {
             };
         }
 
-        let cut_valid = self.find_smart_seam(gray_pair, region, overlap_valid, &self.scratch.stable_blocks);
+        let cut_valid = self.find_smart_seam(gray_pair, region, overlap_valid, &self.scratch.content_blocks);
 
         let trim_prev = overlap_valid.saturating_sub(cut_valid);
         let append_start = fixed_top as usize + cut_valid;
@@ -512,23 +487,41 @@ impl ScrollStitcher {
         out
     }
 
-    fn detect_sticky_regions(&self, prev: &[f32], next: &[f32], width: usize, height: usize) -> (u32, u32) {
+    /// Detect fixed (sticky) header/footer bands that stay put while the body
+    /// scrolls, so they are not appended repeatedly.
+    ///
+    /// A band only counts as sticky when it is both *unchanged* between frames
+    /// AND carries real content (edge energy). Blank rows are unchanged too —
+    /// the whitespace at the top/bottom of a scrolling viewport looks identical
+    /// frame to frame — but they are empty scroll space, not a sticky UI band.
+    /// Treating them as sticky would trim real content out of the stitch.
+    fn detect_sticky_regions(&self, prev: &[f32], next: &[f32], edge_prev: &[f32], width: usize, height: usize) -> (u32, u32) {
         if width == 0 || height == 0 {
             return (0, 0);
         }
 
-        let threshold = self.config.dynamic_threshold;
+        let diff_threshold = self.config.dynamic_threshold;
+        let content_threshold = self.config.dynamic_threshold;
         let max_check = (height / 3).max(1);
 
-        let mut top = 0usize;
-        while top < max_check {
-            let row_start = top * width;
+        let row_metrics = |row: usize| -> (f32, f32) {
+            let row_start = row * width;
             let mut diff = 0.0f32;
+            let mut energy = 0.0f32;
             for x in 0..width {
                 let idx = row_start + x;
                 diff += (prev[idx] - next[idx]).abs();
+                energy += edge_prev[idx];
             }
-            if diff / width as f32 > threshold {
+            (diff / width as f32, energy / width as f32)
+        };
+
+        let mut top = 0usize;
+        while top < max_check {
+            let (diff, energy) = row_metrics(top);
+            // Stop at the first row that either moved or is blank: a sticky band
+            // is a contiguous run of unchanged, content-bearing rows.
+            if diff > diff_threshold || energy < content_threshold {
                 break;
             }
             top += 1;
@@ -536,14 +529,8 @@ impl ScrollStitcher {
 
         let mut bottom = 0usize;
         while bottom < max_check {
-            let row = height - 1 - bottom;
-            let row_start = row * width;
-            let mut diff = 0.0f32;
-            for x in 0..width {
-                let idx = row_start + x;
-                diff += (prev[idx] - next[idx]).abs();
-            }
-            if diff / width as f32 > threshold {
+            let (diff, energy) = row_metrics(height - 1 - bottom);
+            if diff > diff_threshold || energy < content_threshold {
                 break;
             }
             bottom += 1;
@@ -552,7 +539,16 @@ impl ScrollStitcher {
         (top as u32, bottom as u32)
     }
 
-    fn detect_stable_blocks(config: StitchConfig, pair: FramePairRef<'_>, region: StitchRegion, out: &mut Vec<usize>) {
+    /// Select the vertical column-blocks that carry enough texture (edge
+    /// energy) to be useful for vertical scroll correlation.
+    ///
+    /// Scroll stitching aligns two frames by matching their textured content.
+    /// Flat regions — whitespace margins, solid backgrounds — carry no vertical
+    /// signal and must be skipped. We therefore keep the blocks whose combined
+    /// edge energy is a meaningful fraction of the busiest block, rather than
+    /// the blocks that happen to be *unchanged* between frames (which, while
+    /// scrolling, are exactly the empty margins and thus useless for matching).
+    fn detect_content_blocks(config: StitchConfig, edge_prev: &[f32], edge_next: &[f32], region: StitchRegion, out: &mut Vec<usize>) {
         let block = config.dynamic_block_size.max(8);
         let block_count = (region.width / block).max(1);
         let y_start = region.fixed_top.min(region.height);
@@ -563,202 +559,60 @@ impl ScrollStitcher {
             out.reserve(block_count - out.capacity());
         }
 
+        let mut energies = Vec::with_capacity(block_count);
+        let mut max_energy = 0.0f32;
         for b in 0..block_count {
             let x0 = b * block;
             let x1 = ((b + 1) * block).min(region.width);
             if x1 <= x0 {
+                energies.push(0.0);
                 continue;
             }
 
-            let mut diff_sum = 0.0f32;
+            let mut energy_sum = 0.0f32;
             let mut count = 0usize;
             for y in y_start..y_end {
                 let row = y * region.width;
                 for x in x0..x1 {
                     let i = row + x;
-                    diff_sum += (pair.prev[i] - pair.next[i]).abs();
+                    energy_sum += edge_prev[i] + edge_next[i];
                     count += 1;
                 }
             }
 
-            if count == 0 {
-                continue;
-            }
-            let avg = diff_sum / count as f32;
-            if avg <= config.dynamic_threshold {
+            let energy = if count == 0 { 0.0 } else { energy_sum / count as f32 };
+            max_energy = max_energy.max(energy);
+            energies.push(energy);
+        }
+
+        if max_energy <= f32::EPSILON {
+            return;
+        }
+
+        let threshold = max_energy * config.content_energy_ratio;
+        for (b, &energy) in energies.iter().enumerate() {
+            if energy >= threshold {
                 out.push(b);
             }
         }
     }
 
-    fn row_signature(config: StitchConfig, edge: &[f32], region: StitchRegion, stable_blocks: &[usize], out: &mut Vec<f32>) {
-        let block = config.dynamic_block_size.max(8);
-        let y_start = region.fixed_top.min(region.height);
-        let y_end = region.height.saturating_sub(region.fixed_bottom).max(y_start + 1);
-
-        out.clear();
-        let capacity = y_end.saturating_sub(y_start);
-        if out.capacity() < capacity {
-            out.reserve(capacity - out.capacity());
-        }
-        for y in y_start..y_end {
-            let row = y * region.width;
-            let mut sum = 0.0f32;
-            let mut n = 0usize;
-            for &b in stable_blocks {
-                let x0 = b * block;
-                let x1 = ((b + 1) * block).min(region.width);
-                for x in x0..x1 {
-                    sum += edge[row + x];
-                    n += 1;
-                }
-            }
-            out.push(if n == 0 { 0.0 } else { sum / n as f32 });
-        }
-
-        let mean = if out.is_empty() {
-            0.0
-        } else {
-            out.iter().copied().sum::<f32>() / out.len() as f32
-        };
-        for v in out.iter_mut() {
-            *v -= mean;
-        }
-    }
-
-    fn downsample_signature(input: &[f32], factor: usize, out: &mut Vec<f32>) {
-        out.clear();
-        if factor <= 1 {
-            out.extend_from_slice(input);
-            return;
-        }
-
-        out.reserve(input.len().div_ceil(factor));
-        for chunk in input.chunks(factor) {
-            let sum = chunk.iter().copied().sum::<f32>();
-            out.push(sum / chunk.len() as f32);
-        }
-    }
-
-    fn signature_score(a: &[f32], b: &[f32], shift: i32, min_overlap: usize) -> Option<f32> {
-        if a.is_empty() || b.is_empty() {
-            return None;
-        }
-
-        let len = a.len().min(b.len()) as i32;
-        let overlap = len - shift.unsigned_abs() as i32;
-        if overlap <= 0 || overlap < min_overlap as i32 {
-            return None;
-        }
-
-        let (a_start, b_start) = if shift >= 0 {
-            (shift as usize, 0usize)
-        } else {
-            (0usize, (-shift) as usize)
-        };
-
-        let overlap = overlap as usize;
-        let mut sum_a = 0.0f32;
-        let mut sum_b = 0.0f32;
-        let mut sum_aa = 0.0f32;
-        let mut sum_bb = 0.0f32;
-        let mut sum_ab = 0.0f32;
-
-        for i in 0..overlap {
-            let av = a[a_start + i];
-            let bv = b[b_start + i];
-            sum_a += av;
-            sum_b += bv;
-            sum_aa += av * av;
-            sum_bb += bv * bv;
-            sum_ab += av * bv;
-        }
-
-        let n = overlap as f32;
-        let cov = sum_ab - (sum_a * sum_b / n);
-        let var_a = (sum_aa - (sum_a * sum_a / n)).max(0.0);
-        let var_b = (sum_bb - (sum_b * sum_b / n)).max(0.0);
-        let denom = (var_a.sqrt() * var_b.sqrt()).max(f32::EPSILON);
-        Some(cov / denom)
-    }
-
-    fn best_signature_shift(a: &[f32], b: &[f32], min_overlap: usize, start_shift: i32, end_shift: i32) -> Option<i32> {
-        let mut best_shift = 0i32;
-        let mut best_score = -1.0f32;
-        let mut found = false;
-
-        for shift in start_shift..=end_shift {
-            let Some(score) = Self::signature_score(a, b, shift, min_overlap) else {
-                continue;
-            };
-            if !found || score > best_score {
-                best_score = score;
-                best_shift = shift;
-                found = true;
-            }
-        }
-
-        if found { Some(best_shift) } else { None }
-    }
-
-    fn multiscale_row_shift(
-        signature_prev: &[f32],
-        signature_next: &[f32],
-        min_overlap: usize,
-        coarse_prev: &mut Vec<f32>,
-        coarse_next: &mut Vec<f32>,
-        medium_prev: &mut Vec<f32>,
-        medium_next: &mut Vec<f32>,
-    ) -> Option<i32> {
-        let len = signature_prev.len().min(signature_next.len());
-        if len < min_overlap {
-            return None;
-        }
-
-        Self::downsample_signature(signature_prev, 4, coarse_prev);
-        Self::downsample_signature(signature_next, 4, coarse_next);
-        Self::downsample_signature(signature_prev, 2, medium_prev);
-        Self::downsample_signature(signature_next, 2, medium_next);
-
-        let mut shift = 0i32;
-
-        let coarse_len = coarse_prev.len().min(coarse_next.len());
-        let coarse_overlap = min_overlap.div_ceil(4).max(4);
-        if coarse_len > coarse_overlap {
-            let max_shift = (coarse_len - coarse_overlap) as i32;
-            shift = Self::best_signature_shift(coarse_prev, coarse_next, coarse_overlap, -max_shift, max_shift).unwrap_or(0);
-        }
-
-        let medium_len = medium_prev.len().min(medium_next.len());
-        let medium_overlap = min_overlap.div_ceil(2).max(6);
-        if medium_len > medium_overlap {
-            let max_shift = (medium_len - medium_overlap) as i32;
-            let center = (shift * 2).clamp(-max_shift, max_shift);
-            let radius = 6i32.min(max_shift.max(1));
-            let start = (center - radius).max(-max_shift);
-            let end = (center + radius).min(max_shift);
-            shift = Self::best_signature_shift(medium_prev, medium_next, medium_overlap, start, end).unwrap_or(center);
-        }
-
-        let full_len = signature_prev.len().min(signature_next.len());
-        if full_len <= min_overlap {
-            return None;
-        }
-        let max_shift = (full_len - min_overlap) as i32;
-        let center = (shift * 2).clamp(-max_shift, max_shift);
-        let radius = 8i32.min(max_shift.max(1));
-        let start = (center - radius).max(-max_shift);
-        let end = (center + radius).min(max_shift);
-        Self::best_signature_shift(signature_prev, signature_next, min_overlap, start, end)
-    }
-
+    /// Find the vertical scroll offset between two frames by directly scanning
+    /// candidate shifts with the full-overlap ZNCC metric.
+    ///
+    /// The earlier design seeded this from a multi-scale row-signature search,
+    /// but that proxy returned wildly wrong (often negative) seeds on
+    /// self-similar content — text pages, repeated list rows — so the true
+    /// offset fell outside the narrow refine window and every frame was
+    /// rejected. Because the full-overlap ZNCC is decisive (a correct shift
+    /// scores ~1.0, a wrong one ~0.0), we can afford to scan the whole
+    /// plausible range instead: a strided coarse pass to locate the peak, then
+    /// a 1px fine pass around it. `coarse_shift` from the old search is ignored.
     fn refine_shift_zncc(
         config: StitchConfig,
         pair: FramePairRef<'_>,
         region: StitchRegion,
-        coarse_shift: i32,
-        stable_blocks: &[usize],
-        strip_scores: &mut Vec<f32>,
+        content_blocks: &[usize],
     ) -> Option<(i32, f32, f32)> {
         let valid_h = region.valid_height() as i32;
         if valid_h <= config.min_overlap as i32 {
@@ -770,16 +624,68 @@ impl ScrollStitcher {
             return None;
         }
 
-        let mut best_shift = 0i32;
-        let mut best_score = -1.0f32;
-        let mut second_score = -1.0f32;
+        // Search forward scrolls up to max_scroll_per_frame, plus a small
+        // reverse margin so genuine slow reverse scrolling is still detected.
+        let forward_limit = config.max_scroll_per_frame.min(max_shift);
+        let reverse_limit = config.max_reverse_scroll.min(max_shift);
+        let stride = config.scan_stride.max(1) as i32;
 
-        let search_start = (coarse_shift - config.zncc_search_radius).max(-max_shift);
-        let search_end = (coarse_shift + config.zncc_search_radius).min(max_shift);
+        // Periodic content (uniform line pitch, repeated rows) produces aliased
+        // peaks: a shifted frame scores nearly as high at shift = k*line-period
+        // as at the true offset. Among all shifts scoring within `tie_margin` of
+        // the best, we prefer the smallest magnitude — the true scroll between
+        // two 16ms frames is small, while aliases sit a full line-period away.
+        // Genuine scrolling is unaffected: the true shift is highest AND
+        // smallest. Two passes over a strided grid: find the global max, then
+        // pick the nearest-to-zero shift that comes within tie_margin of it.
+        let tie_margin = 0.02f32;
+        let stride_us = stride.max(1) as usize;
 
-        for shift in search_start..=search_end {
-            let score = Self::zncc_score_for_shift(config, pair, region, shift, stable_blocks, strip_scores);
+        // Build the strided candidate grid (always including 0).
+        let mut candidates: Vec<i32> = Vec::new();
+        candidates.push(0);
+        let mut s = stride;
+        while s <= forward_limit {
+            candidates.push(s);
+            s += stride;
+        }
+        let mut s = -stride;
+        while s >= -reverse_limit {
+            candidates.push(s);
+            s -= stride;
+        }
 
+        let mut global_best = f32::MIN;
+        let mut scored: Vec<(i32, f32)> = Vec::with_capacity(candidates.len());
+        for &shift in &candidates {
+            let score = Self::zncc_score_for_shift(config, pair, region, shift, content_blocks, stride_us);
+            if score > global_best {
+                global_best = score;
+            }
+            scored.push((shift, score));
+        }
+
+        let mut coarse_best_shift = 0i32;
+        let mut coarse_pick_mag = i32::MAX;
+        for &(shift, score) in &scored {
+            if score >= global_best - tie_margin && shift.abs() < coarse_pick_mag {
+                coarse_pick_mag = shift.abs();
+                coarse_best_shift = shift;
+            }
+        }
+
+        // Fine 1px pass around the coarse peak, scored at full resolution. The
+        // coarse pass already resolved the period-aliasing ambiguity by picking
+        // the smallest-magnitude peak, so here we want the single highest-
+        // scoring shift for a pixel-accurate seam — taking a 1-2px-smaller
+        // near-tie instead would leave a thin band of doubled content.
+        let fine_start = (coarse_best_shift - stride).max(-reverse_limit);
+        let fine_end = (coarse_best_shift + stride).min(forward_limit);
+        let mut best_shift = coarse_best_shift;
+        let mut best_score = f32::MIN;
+        let mut second_score = -2.0f32;
+        for shift in fine_start..=fine_end {
+            let score = Self::zncc_score_for_shift(config, pair, region, shift, content_blocks, 1);
             if score > best_score {
                 second_score = best_score;
                 best_score = score;
@@ -800,13 +706,23 @@ impl ScrollStitcher {
         Some((best_shift, best_score, second_score))
     }
 
+    /// Score a candidate vertical shift by correlating the ENTIRE overlapping
+    /// region of the two frames — every row in the overlap, across all textured
+    /// columns — with a single normalized cross-correlation (ZNCC).
+    ///
+    /// This is the trust metric the append decision hinges on. A correct scroll
+    /// offset lines the same pixels up and scores ~1.0; any wrong offset scores
+    /// low. The previous implementation only sampled a few tiny 8px patches, a
+    /// proxy so weak that true and false shifts scored alike — which forced the
+    /// confidence threshold so low that wrong matches slipped through and
+    /// produced duplicated bands in the stitched image.
     fn zncc_score_for_shift(
         config: StitchConfig,
         pair: FramePairRef<'_>,
         region: StitchRegion,
         shift: i32,
-        stable_blocks: &[usize],
-        strip_scores: &mut Vec<f32>,
+        content_blocks: &[usize],
+        stride: usize,
     ) -> f32 {
         let valid_h = region.valid_height() as i32;
         let overlap = valid_h - shift.abs();
@@ -814,104 +730,66 @@ impl ScrollStitcher {
             return -1.0;
         }
 
-        let strips = config.zncc_strip_count.max(3);
-        let patch_h = config.zncc_patch_height.max(4) as i32;
-        let block = config.dynamic_block_size.max(8) as i32;
+        let block = config.dynamic_block_size.max(8);
+        let stride = stride.max(1);
+        // For a shift, `prev` row (fixed_top + prev_off + i) aligns with `next`
+        // row (fixed_top + next_off + i) for i in 0..overlap.
+        let prev_off = if shift >= 0 { shift } else { 0 } as usize;
+        let next_off = if shift >= 0 { 0 } else { -shift } as usize;
+        let base = region.fixed_top;
+        let overlap = overlap as usize;
 
-        if strip_scores.capacity() < strips {
-            strip_scores.reserve(strips - strip_scores.capacity());
-        }
-        strip_scores.clear();
-        for si in 0..strips {
-            let ratio = (si + 1) as f32 / (strips + 1) as f32;
-            let overlap_start_next = if shift >= 0 { 0 } else { -shift };
-            let overlap_start_prev = if shift >= 0 { shift } else { 0 };
-            let center = ((overlap as f32) * ratio) as i32;
-
-            let next_y = region.fixed_top as i32 + overlap_start_next + center;
-            let prev_y = region.fixed_top as i32 + overlap_start_prev + center;
-
-            let y0_next = (next_y - patch_h / 2).clamp(region.fixed_top as i32, region.height as i32 - region.fixed_bottom as i32 - patch_h - 1);
-            let y0_prev = (prev_y - patch_h / 2).clamp(region.fixed_top as i32, region.height as i32 - region.fixed_bottom as i32 - patch_h - 1);
-
-            let mut score_sum = 0.0f32;
-            let mut score_count = 0usize;
-            for &b in stable_blocks {
-                let x0 = (b as i32 * block).min(region.width as i32 - 1);
-                let x1 = ((b as i32 + 1) * block).min(region.width as i32);
-                if x1 - x0 < 2 {
-                    continue;
-                }
-                let patch = ZNCCPatch {
-                    x0: x0 as usize,
-                    x1: x1 as usize,
-                    y0_prev: y0_prev as usize,
-                    y0_next: y0_next as usize,
-                    patch_h: patch_h as usize,
-                };
-                let score = Self::zncc_patch(pair, region.width, patch);
-                if score.is_finite() {
-                    score_sum += score;
-                    score_count += 1;
-                }
-            }
-
-            if score_count == 0 {
-                continue;
-            }
-            strip_scores.push(score_sum / score_count as f32);
-        }
-
-        if strip_scores.is_empty() {
-            return -1.0;
-        }
-
-        strip_scores.iter().sum::<f32>() / strip_scores.len() as f32
-    }
-
-    fn zncc_patch(pair: FramePairRef<'_>, width: usize, patch: ZNCCPatch) -> f32 {
         let mut sum_p = 0.0f32;
         let mut sum_n = 0.0f32;
+        let mut sum_pp = 0.0f32;
+        let mut sum_nn = 0.0f32;
+        let mut sum_pn = 0.0f32;
         let mut count = 0usize;
 
-        for dy in 0..patch.patch_h {
-            let row_p = (patch.y0_prev + dy) * width;
-            let row_n = (patch.y0_next + dy) * width;
-            for x in patch.x0..patch.x1 {
-                sum_p += pair.prev[row_p + x];
-                sum_n += pair.next[row_n + x];
-                count += 1;
+        let mut i = 0usize;
+        while i < overlap {
+            let row_p = (base + prev_off + i) * region.width;
+            let row_n = (base + next_off + i) * region.width;
+            for &b in content_blocks {
+                let x0 = b * block;
+                let x1 = ((b + 1) * block).min(region.width);
+                let mut x = x0;
+                while x < x1 {
+                    let p = pair.prev[row_p + x];
+                    let n = pair.next[row_n + x];
+                    sum_p += p;
+                    sum_n += n;
+                    sum_pp += p * p;
+                    sum_nn += n * n;
+                    sum_pn += p * n;
+                    count += 1;
+                    x += stride;
+                }
             }
+            i += stride;
         }
 
         if count == 0 {
+            return -1.0;
+        }
+
+        let n = count as f32;
+        let cov = sum_pn - (sum_p * sum_n / n);
+        let var_p = (sum_pp - (sum_p * sum_p / n)).max(0.0);
+        let var_n = (sum_nn - (sum_n * sum_n / n)).max(0.0);
+        // If either side is (near-)flat there is no correlation signal, so the
+        // normalized score is undefined. Return 0 rather than dividing by a
+        // clamped epsilon, which would blow a nonzero covariance up to a huge
+        // spurious value and corrupt peak selection.
+        let var_floor = n * 1e-3;
+        if var_p < var_floor || var_n < var_floor {
             return 0.0;
         }
-
-        let mean_p = sum_p / count as f32;
-        let mean_n = sum_n / count as f32;
-
-        let mut cov = 0.0f32;
-        let mut var_p = 0.0f32;
-        let mut var_n = 0.0f32;
-
-        for dy in 0..patch.patch_h {
-            let row_p = (patch.y0_prev + dy) * width;
-            let row_n = (patch.y0_next + dy) * width;
-            for x in patch.x0..patch.x1 {
-                let p = pair.prev[row_p + x] - mean_p;
-                let n = pair.next[row_n + x] - mean_n;
-                cov += p * n;
-                var_p += p * p;
-                var_n += n * n;
-            }
-        }
-
-        let denom = (var_p.sqrt() * var_n.sqrt()).max(f32::EPSILON);
-        cov / denom
+        let score = cov / (var_p.sqrt() * var_n.sqrt());
+        score.clamp(-1.0, 1.0)
     }
 
-    fn find_smart_seam(&self, pair: FramePairRef<'_>, region: StitchRegion, overlap_valid: usize, stable_blocks: &[usize]) -> usize {
+    fn find_smart_seam(&self, pair: FramePairRef<'_>, region: StitchRegion, overlap_valid: usize, content_blocks: &[usize]) -> usize {
         let block = self.config.dynamic_block_size.max(8);
         let search_start = overlap_valid / self.config.seam_margin_divisor.max(2) as usize;
         let search_end =
@@ -929,7 +807,7 @@ impl ScrollStitcher {
 
             let mut energy = 0.0f32;
             let mut n = 0usize;
-            for &b in stable_blocks {
+            for &b in content_blocks {
                 let x0 = b * block;
                 let x1 = ((b + 1) * block).min(region.width);
                 for x in x0..x1 {
@@ -1018,55 +896,256 @@ mod tests {
     use super::*;
     use image::{Rgba, RgbaImage, imageops};
 
-    fn source(width: u32, height: u32) -> RgbaImage {
-        let mut img = RgbaImage::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let r = (((x * 31) ^ (y * 17)) & 0xff) as u8;
-                let g = (((x * 13) ^ (y * 57)) & 0xff) as u8;
-                let b = (((x * 97) ^ (y * 29)) & 0xff) as u8;
-                img.put_pixel(x, y, Rgba([r, g, b, 255]));
-            }
-        }
-        img
-    }
-
     fn crop_frame(source: &RgbaImage, y: u32, h: u32) -> RgbaImage {
         imageops::crop_imm(source, 0, y, source.width(), h).to_image()
+    }
+
+    /// A text-like page: white background, sparse dark "glyphs" on periodic
+    /// text lines, with whitespace left/right margins — the layout of a
+    /// typical web article or chat log. Every text line gets a distinct glyph
+    /// pattern so rows are not self-similar (as with real anti-aliased text).
+    fn text_page(width: u32, height: u32) -> RgbaImage {
+        let mut page = RgbaImage::from_pixel(width, height, Rgba([250, 250, 250, 255]));
+        let margin = width / 10;
+        for y in 0..height {
+            // Denser text: 20px line pitch, 16px glyph band (like body copy).
+            if (y % 20) < 16 {
+                let line = y / 20;
+                for x in margin..(width - margin) {
+                    let h = (x.wrapping_mul(2_654_435_761)) ^ (y.wrapping_mul(40_503)) ^ (line.wrapping_mul(2_246_822_519));
+                    if (h & 0x3) < 2 {
+                        let v = (h >> 8 & 0x3f) as u8;
+                        page.put_pixel(x, y, Rgba([v, v, v, 255]));
+                    }
+                }
+            }
+        }
+        page
+    }
+
+    #[test]
+    fn stitcher_reconstructs_full_page_on_scroll() {
+        // Regression: text pages have whitespace margins, so the old
+        // "unchanged column" selector kept only the (flat) margins and
+        // rejected every frame after the first, capturing just one viewport.
+        // The old sticky-region detector also mistook scrolling whitespace for
+        // a fixed footer and trimmed real content. With both fixed, a full
+        // top-to-bottom scroll must reconstruct far more than one viewport.
+        let page_w = 300u32;
+        let page_h = 1800u32;
+        let view_h = 300u32;
+        let page = text_page(page_w, page_h);
+
+        for step in [4u32, 8, 12] {
+            let mut stitcher = ScrollStitcher::new();
+            let mut y = 0u32;
+            let mut guard = 0;
+            loop {
+                let _ = stitcher.process_frame_detailed(crop_frame(&page, y, view_h));
+                if y + view_h >= page_h {
+                    break;
+                }
+                y = (y + step).min(page_h - view_h);
+                guard += 1;
+                assert!(guard < 5000, "scroll loop failed to terminate");
+            }
+
+            let final_img = stitcher.get_final_image().expect("final image");
+            // Must reconstruct well beyond a single viewport. (A lossy stitcher
+            // drops some frames at speed, so we require solid coverage rather
+            // than the full page height.)
+            assert!(
+                final_img.height() >= view_h * 2,
+                "step={step}: expected >= {} rows (much more than one viewport), got {}",
+                view_h * 2,
+                final_img.height()
+            );
+        }
+    }
+
+    #[test]
+    fn detect_content_blocks_skips_flat_margins() {
+        // Whitespace margins carry no edge energy and must be excluded, while
+        // the textured interior columns are kept.
+        let page = text_page(300, 400);
+        let analysis = FrameAnalysis::from_image(&page);
+        let region = StitchRegion {
+            width: analysis.width,
+            height: analysis.height,
+            fixed_top: 0,
+            fixed_bottom: 0,
+        };
+        let mut blocks = Vec::new();
+        ScrollStitcher::detect_content_blocks(StitchConfig::default(), &analysis.edge, &analysis.edge, region, &mut blocks);
+
+        assert!(blocks.len() >= StitchConfig::default().min_content_blocks);
+        // The far-left margin block (block 0) is flat white and must be dropped.
+        assert!(!blocks.contains(&0), "flat left margin should not be a content block");
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored"]
+    fn bench_process_frame_realistic_size() {
+        // Real capture frames are ~1492x586 on a 2x display. Verify a single
+        // process_frame_detailed stays well under the ~16ms frame budget.
+        let page = text_page(1492, 4000);
+        let mut stitcher = ScrollStitcher::new();
+        let _ = stitcher.process_frame_detailed(crop_frame(&page, 0, 586));
+        let iters = 20u32;
+        let start = std::time::Instant::now();
+        for k in 0..iters {
+            let y = 40 + k * 12;
+            let _ = stitcher.process_frame_detailed(crop_frame(&page, y, 586));
+        }
+        let per = start.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+        eprintln!("BENCH process_frame avg = {per:.2} ms/frame (budget ~16ms)");
+        assert!(per < 16.0, "per-frame cost {per:.2}ms exceeds frame budget");
+    }
+
+    #[test]
+    fn zncc_scores_true_shift_high_and_wrong_shift_low() {
+        // A correct scroll offset must score near 1.0 (identical overlapping
+        // pixels), and an incorrect offset must score much lower — that gap is
+        // what lets the append gate reject duplicate-producing wrong matches.
+        let page = text_page(240, 900);
+        let prev = crop_frame(&page, 0, 300);
+        let next = crop_frame(&page, 20, 300); // true shift = 20
+
+        let prev_a = FrameAnalysis::from_image(&prev);
+        let next_a = FrameAnalysis::from_image(&next);
+        let region = StitchRegion {
+            width: prev_a.width,
+            height: prev_a.height,
+            fixed_top: 0,
+            fixed_bottom: 0,
+        };
+        let mut blocks = Vec::new();
+        ScrollStitcher::detect_content_blocks(StitchConfig::default(), &prev_a.edge, &next_a.edge, region, &mut blocks);
+        let pair = FramePairRef {
+            prev: &prev_a.gray,
+            next: &next_a.gray,
+        };
+        let good = ScrollStitcher::zncc_score_for_shift(StitchConfig::default(), pair, region, 20, &blocks, 1);
+        let bad = ScrollStitcher::zncc_score_for_shift(StitchConfig::default(), pair, region, 137, &blocks, 1);
+        eprintln!("ZNCC true(20)={good:.3} wrong(137)={bad:.3}");
+        assert!(good > 0.9, "true shift should score high, got {good:.3}");
+        assert!(good - bad > 0.3, "true shift must clearly beat a wrong shift ({good:.3} vs {bad:.3})");
     }
 
     #[test]
     fn stitcher_appends_on_forward_scroll() {
         let mut stitcher = ScrollStitcher::new();
-        let src = source(240, 420);
+        let src = text_page(240, 900);
 
-        let first = crop_frame(&src, 0, 180);
-        let second = crop_frame(&src, 24, 180);
-
-        assert_eq!(stitcher.process_frame_detailed(first).status, StitchFrameStatus::Appended);
-        let detail = stitcher.process_frame_detailed(second);
-        assert!(matches!(detail.status, StitchFrameStatus::Appended | StitchFrameStatus::LowConfidence));
-        assert!(detail.height >= 180);
+        // Feed a short sequence of small forward scrolls, as the live capture
+        // loop does (~16ms frames). The canvas must grow past the first frame.
+        assert_eq!(stitcher.process_frame_detailed(crop_frame(&src, 0, 300)).status, StitchFrameStatus::Appended);
+        let mut appended = 0;
+        for y in [8u32, 16, 24, 32, 40] {
+            if stitcher.process_frame_detailed(crop_frame(&src, y, 300)).status == StitchFrameStatus::Appended {
+                appended += 1;
+            }
+        }
+        assert!(appended >= 3, "expected most small scrolls to append, got {appended}/5");
+        let (_, height) = stitcher.current_image().expect("canvas");
+        assert!(height > 300, "canvas should extend past the first frame, got {height}");
     }
 
     #[test]
     fn stitcher_marks_stationary_for_same_frame() {
         let mut stitcher = ScrollStitcher::new();
-        let src = source(200, 420);
-        let first = crop_frame(&src, 10, 160);
+        let src = text_page(240, 900);
+        let first = crop_frame(&src, 40, 300);
         assert_eq!(stitcher.process_frame_detailed(first.clone()).status, StitchFrameStatus::Appended);
         assert_eq!(stitcher.process_frame_detailed(first).status, StitchFrameStatus::Stationary);
+    }
+
+    /// A non-periodic page: every row has a distinct random texture with no
+    /// repeating pitch, so a given shift matches at exactly one offset. Real
+    /// screen content (unique glyphs, varied layout) behaves this way; use this
+    /// where period-aliasing of the synthetic `text_page` would confound the
+    /// test (e.g. verifying reverse detection).
+    fn unique_page(width: u32, height: u32) -> RgbaImage {
+        let mut page = RgbaImage::from_pixel(width, height, Rgba([250, 250, 250, 255]));
+        let margin = width / 10;
+        for y in 0..height {
+            for x in margin..(width - margin) {
+                let h = (x.wrapping_mul(2_654_435_761)) ^ (y.wrapping_mul(2_246_822_519)).wrapping_add(y.wrapping_mul(y));
+                if (h & 0x3) < 2 {
+                    let v = (h >> 8 & 0x3f) as u8;
+                    page.put_pixel(x, y, Rgba([v, v, v, 255]));
+                }
+            }
+        }
+        page
+    }
+
+    #[test]
+    fn thumbnail_keeps_growing_as_canvas_grows() {
+        // The preview thumbnail must keep getting taller as more of the page is
+        // stitched — regression for "preview freezes while px counter climbs".
+        let page = unique_page(300, 6000);
+        let view_h = 300u32;
+        let mut stitcher = ScrollStitcher::new();
+        let _ = stitcher.process_frame_detailed(crop_frame(&page, 0, view_h));
+
+        let mut heights = Vec::new();
+        let mut y = 0u32;
+        for _ in 0..120 {
+            y = (y + 12).min(6000 - view_h);
+            let _ = stitcher.process_frame_detailed(crop_frame(&page, y, view_h));
+            if let Some(t) = stitcher.make_thumbnail(500) {
+                heights.push(t.height());
+            }
+            if y + view_h >= 6000 {
+                break;
+            }
+        }
+
+        let first = *heights.first().expect("some thumbnails");
+        let last = *heights.last().expect("some thumbnails");
+        assert!(last > first, "thumbnail should grow taller ({first} -> {last})");
+        // Monotonic non-decreasing.
+        for w in heights.windows(2) {
+            assert!(w[1] >= w[0], "thumbnail height regressed: {} -> {}", w[0], w[1]);
+        }
     }
 
     #[test]
     fn stitcher_reports_reverse() {
         let mut stitcher = ScrollStitcher::new();
-        let src = source(200, 420);
-        let first = crop_frame(&src, 80, 160);
-        let reverse = crop_frame(&src, 30, 160);
-
-        assert_eq!(stitcher.process_frame_detailed(first).status, StitchFrameStatus::Appended);
-        let detail = stitcher.process_frame_detailed(reverse);
+        let src = unique_page(240, 900);
+        // Scroll forward, then a small reverse step (within the reverse search
+        // range) must be recognized and pause the capture rather than append.
+        assert_eq!(stitcher.process_frame_detailed(crop_frame(&src, 60, 300)).status, StitchFrameStatus::Appended);
+        let detail = stitcher.process_frame_detailed(crop_frame(&src, 54, 300));
         assert!(matches!(detail.status, StitchFrameStatus::Reverse | StitchFrameStatus::LowConfidence));
+    }
+
+    #[test]
+    fn slow_sub_threshold_scroll_still_accumulates() {
+        // Regression: a slow drag advances only 1-2px per frame — below
+        // min_scroll_threshold. If each Stationary frame reset the reference,
+        // that motion would never accumulate and the canvas would freeze at the
+        // first frame (the "preview never grows" bug). Holding the reference
+        // across sub-threshold frames must let the offset build up and append.
+        let page_h = 900u32;
+        let view_h = 300u32;
+        let page = text_page(240, page_h);
+
+        let mut stitcher = ScrollStitcher::new();
+        assert_eq!(stitcher.process_frame_detailed(crop_frame(&page, 0, view_h)).status, StitchFrameStatus::Appended);
+
+        // Advance 1px at a time (well under the 4px threshold).
+        let mut saw_append = false;
+        for y in 1..=40u32 {
+            if stitcher.process_frame_detailed(crop_frame(&page, y, view_h)).status == StitchFrameStatus::Appended {
+                saw_append = true;
+            }
+        }
+
+        assert!(saw_append, "slow 1px scrolls must eventually append");
+        let (_, height) = stitcher.current_image().expect("canvas");
+        assert!(height > view_h, "canvas should grow past the first frame, got {height}");
     }
 }

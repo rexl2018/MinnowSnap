@@ -10,6 +10,12 @@ use tracing::error;
 const SCALE_EPSILON: f32 = 0.01;
 const CAPTURE_LOOP_INTERVAL: Duration = Duration::from_millis(16);
 const PREVIEW_EVENT_INTERVAL: Duration = Duration::from_millis(33);
+/// Discard frames for a short warmup before the stitcher starts. The capture
+/// thread launches while the selection overlay (blue tint + border) that
+/// triggered the long capture is still being torn down, so the very first
+/// frames can still contain that chrome. Waiting a beat ensures the first
+/// stitched frame is clean screen content.
+const CAPTURE_WARMUP: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CaptureFrameTarget {
@@ -88,6 +94,14 @@ impl LongCaptureRuntime {
             let mut warned = false;
             let mut preview_emitted = false;
             let mut last_preview_emit = Instant::now();
+
+            // Let the triggering selection overlay finish closing before the
+            // first frame is captured, so its chrome is not baked into the
+            // canvas top.
+            let warmup_deadline = Instant::now() + CAPTURE_WARMUP;
+            while active.load(Ordering::SeqCst) && Instant::now() < warmup_deadline {
+                std::thread::sleep(CAPTURE_LOOP_INTERVAL);
+            }
 
             while active.load(Ordering::SeqCst) {
                 match monitor.capture_image() {

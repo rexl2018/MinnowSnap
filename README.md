@@ -40,20 +40,31 @@ cargo install cargo-bundle
 cd crates/minnow-app
 cargo bundle --release --format osx
 
-# Re-sign the whole bundle. cargo-bundle leaves only the linker's ad-hoc
-# signature on the inner binary and does not bind the Info.plist, so the
-# bundle signature is invalid. macOS TCC then fails to verify the app and
-# re-prompts for Screen Recording on every capture, never remembering the
-# grant. A fresh ad-hoc signature over the whole bundle fixes this.
-codesign --force --deep --sign - ../../target/release/bundle/osx/MinnowSnap.app
+# Sign the bundle with a stable, self-signed local identity. cargo-bundle
+# leaves only an ad-hoc signature, whose designated requirement is the cdhash —
+# it changes on every rebuild, so macOS TCC treats each build as a new app and
+# re-prompts for Screen Recording, never remembering the grant. The script
+# below creates a persistent signing certificate (once, in your login keychain)
+# and signs with it, giving a stable identity-based requirement so the grant
+# survives rebuilds.
+../../scripts/macos-sign.sh
 ```
 
 The bundle is written to `target/release/bundle/osx/MinnowSnap.app`. Launch it
 once and grant Screen Recording access when prompted (or via **System Settings →
 Privacy & Security → Screen & System Audio Recording**), then relaunch the app.
 
-If you rebuilt after already granting access, clear the stale entry so macOS
-re-reads the new signature identity:
+Because the bundle is signed with a stable identity, that grant now persists
+across rebuilds — re-run `scripts/macos-sign.sh` after each `cargo bundle` and
+macOS keeps the permission instead of re-prompting.
+
+> The first time `codesign` uses the new key, macOS may show a one-time
+> keychain prompt ("codesign wants to sign using key …"). Click **Always
+> Allow**. That is a keychain prompt, not the Screen Recording prompt, and it
+> does not recur.
+
+If you previously used the old ad-hoc signature and macOS still has a stale
+entry, clear it once so it re-reads the new stable identity:
 
 ```sh
 tccutil reset ScreenCapture com.lortunate.minnowsnap

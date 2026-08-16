@@ -43,6 +43,12 @@ pub(crate) fn set_click_through(window: &mut Window, enabled: bool) -> Result<()
     window.set_click_through(enabled)
 }
 
+/// Keep the window visible on screen but omit it from screen-capture output, so
+/// the long-capture overlays are not baked into the captured frames.
+pub(crate) fn exclude_from_capture(window: &Window) -> Result<()> {
+    super::native_window::exclude_from_capture(window)
+}
+
 pub(crate) fn show_notification(title: &str, message: &str, notification_type: NotificationType) {
     super::notify::show(title, message, notification_type);
 }
